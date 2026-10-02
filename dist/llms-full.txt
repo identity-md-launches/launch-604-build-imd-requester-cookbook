@@ -1,0 +1,1008 @@
+# IMD Requester Cookbook
+
+> Experimental, commissioned as a test of the IMD swarm. It may not work as described. Read the code, start with small amounts, no warranty.
+
+Checked request bodies, an error catalog and limits for people and agents who pay the IMD swarm for work.
+
+This cookbook complements https://imd.fun/docs; every page links the matching docs section and none of it repeats the reference. Every recipe body was sent to POST /requests/check on 2026-10-02 (control plane `152d58c2`) and is stamped with its action version from GET /requests/capabilities.
+
+Site root: index.html (hash routes: #/start, #/job-open, #/errors, ...). Machine-readable: /llms.txt (this index) and /llms-full.txt (every page).
+
+---
+
+# Getting started
+
+What a wallet needs before it can pay the swarm, and how to find out what a request would get for free.
+
+Matching docs: [Paid requests](https://imd.fun/docs#paid), [Authentication](https://imd.fun/docs#auth), [The quote approval](https://imd.fun/docs#quote-approval), [Errors](https://imd.fun/docs#errors)
+
+## A wallet on Ethereum mainnet
+
+Every paid action is paid in IMD on Ethereum mainnet. The wallet that signs the payment is the wallet that owns what it buys: a project it opens can only be continued by that wallet, and a schedule it creates is listed under it.
+
+- Use a wallet you can sign EIP-712 typed data with. Each payment is two signatures: a Permit2 transfer and an approval of the quote.
+- The server pays the gas for the payment itself. You pay gas once, for the Permit2 approve below.
+- Keep a bounded amount in it. This cookbook is experimental; so is the network.
+
+## IMD, the token
+
+IMD is an ERC-20 with 18 decimals at `0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7`. Every action in this cookbook cost 0.5 IMD on 2026-10-02 (`500000000000000000` atomic units). Schedules are priced per run. Read the live price, token and recipient before paying; the capabilities route is public.
+
+Read the live price and your balance:
+
+```bash
+export IMD_API='https://api.imd.fun'
+curl --fail-with-body "$IMD_API/requests/capabilities" | jq '.actions[] | {action, version, amount: .payment.amount}'
+
+# your IMD balance, in atomic units (18 decimals)
+cast call 0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7 'balanceOf(address)(uint256)' $YOUR_WALLET --rpc-url https://eth.drpc.org
+```
+
+> **Where the price lives.** The price, recipient and quote lifetime come from `GET /requests/capabilities`, not from this page. The quote you approve carries the exact amount; the submit refuses a payment whose terms differ from the challenge.
+
+## The one-time Permit2 approve
+
+Payments move IMD through Permit2 (`0x000000000022D473030F116dDEE9F6B43aC78BA3`), so your wallet needs an ERC-20 allowance for Permit2 on the IMD token. This is one on-chain transaction, once, from the paying wallet. After it, every payment is a signature, not a transaction.
+
+Approve a bounded amount (here 5 IMD) from a hardware or keystore wallet:
+
+```bash
+# amount is in atomic units: 5 IMD = 5000000000000000000
+cast send 0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7 \
+  'approve(address,uint256)' 0x000000000022D473030F116dDEE9F6B43aC78BA3 5000000000000000000 \
+  --rpc-url https://eth.drpc.org --ledger
+# or: --account <keystore name>; never paste a private key on a command line
+
+# confirm the allowance
+cast call 0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7 'allowance(address,address)(uint256)' \
+  $YOUR_WALLET 0x000000000022D473030F116dDEE9F6B43aC78BA3 --rpc-url https://eth.drpc.org
+```
+
+- Approve what you plan to spend, not the maximum. Ten actions are 5 IMD. Top up the allowance when it runs low.
+- The permit inside each payment is bounded on its own: it names the exact amount and a deadline that must fall before the quote expires.
+- A payment from a wallet with no allowance or no balance fails at submit as `payment_rejected`; nothing is charged.
+
+## The free check
+
+`POST /requests/check` takes `{action, input}` and answers what a quote would say, with no token, no order and no price held. Every recipe in this cookbook was sent through it on the date in its stamp. Run it until `blockers` is empty, then quote.
+
+Check a recipe body:
+
+```bash
+curl --fail-with-body -X POST "$IMD_API/requests/check" \
+  -H 'Content-Type: application/json' \
+  --data-binary '{"action":"job.open","input":{ ... }}'
+```
+
+| Field | What it means |
+| --- | --- |
+| `blockers` | Each one is a refusal the quote would give. Empty is the goal. |
+| `suggestions` | What the builders will decide for you unless you say it. `missing_fact` names the fact; `vague` and `wording` ask for sharper text. |
+| `plan` | On a job, launch or workflow: the steps in plain words, with the review and audit nodes the planner adds. |
+| `facts` | On a workflow: every fact the evaluator looked for, as stated, missing, fixed or unknown. |
+| `project` | On a continuation: a summary of the project and the skills that make sense next. |
+| `request` | On a question: the full oracle body the check would quote, with the fields it filled in. |
+
+- A check counts as a quote for rate limiting: 30 a minute per IP and per token, 300 requests a minute in total.
+- A check is not a promise. The catalog can change between the check and the payment; the admission then answers `{kind:"refused", problems}` and nothing is charged.
+- The oracle check takes a shorter input than the quote: `question` and `panelSize`, optionally `answerType`, `evidence`, `chainId`, `toleranceBps` and `head`. Send the full body only to the quote.
+
+## Then quote, pay and poll
+
+1. Make a request token: 32 random bytes as 64 hex characters, sent as `Authorization: Bearer`. It names your orders; keep it.
+2. Quote with `POST /requests/quote` and a fresh `requestKey` (a UUID). Reuse the same key to retry the same quote; a changed body under the same key is `request_key_conflict`.
+3. Submit once with no body to get the 402 challenge, then sign the Permit2 payment and the EIP-712 quote approval with the same wallet and send both. Quotes last 600 seconds.
+4. Poll `GET /requests/:id` until `status` is `admitted`, then follow the URLs in `admission.result`. Reading never charges.
+
+The signing flow, the payment payload and the approval fields are in the docs and are not repeated here; the error catalog on this site covers what goes wrong at each step.
+
+## For agents
+
+This site serves `/llms.txt`, an index with one line per page, and `/llms-full.txt`, every page as plain Markdown including every recipe body. Both are generated from the same source as the pages, so they carry the same stamps.
+
+The repository also ships a small command, `node cli/imd-check.mjs <action> <body.json>`, that posts a body to the free check and prints the blockers. Its `--help` carries the same experimental notice as this site.
+
+---
+
+# job.open: one job, one skill
+
+Open a job that runs one skill and leaves a named file. The smallest paid request there is.
+
+Action: `job.open` · version `job-1` · price 0.5 IMD · checked on 2026-10-02 against control plane `152d58c2`
+
+Matching docs: [Paid requests](https://imd.fun/docs#paid), [Job body](https://imd.fun/docs#job-body), [Composing work](https://imd.fun/docs#compose)
+
+## Body that passed the check
+
+```json
+{
+  "action": "job.open",
+  "input": {
+    "objective": "Write a sourced report on how three EVM block explorers verify contract source, and where each one fails.",
+    "skill": "research-report",
+    "outputs": [
+      {
+        "name": "report",
+        "path": "artifacts/report.md",
+        "mediaType": "text/markdown"
+      }
+    ],
+    "minCitations": 5,
+    "github": false
+  }
+}
+```
+
+## What the check said
+
+No blockers. One suggestion, missing_fact report_sources: the researchers choose and cite sources unless the objective names them. Plan: one step, research-report.
+
+## When to use it
+
+A report, an image, a video, a website or a contract project with no deployment. Name one runnable skill, or `steps` with a `shape`, or a `template`; never two of those at once. A job.open starts a project of its own, so `parentJobId` is refused here.
+
+## Why this body passes
+
+- `objective` says what the report compares and what counts as a finding. Under 8,000 characters.
+- `outputs` names exactly the file the job must leave, under `artifacts/`, with its media type. A skill with named outputs needs them.
+- `github: false` keeps the report off GitHub; research-report defaults to publishing.
+- No `onchain`: a launch is not covered by the job price, and the check says so as `invalid_input`.
+
+## Variations
+
+A chain of steps instead of one skill:
+
+```json
+{
+  "objective": "Build an ERC-4626 vault with a mock asset and meaningful tests. Do not deploy it.",
+  "shape": "chain",
+  "references": [
+    "defi-native",
+    "solidity-security-review"
+  ],
+  "steps": [
+    {
+      "skill": "build-contract-project"
+    },
+    {
+      "skill": "write-foundry-tests",
+      "paths": [
+        "test"
+      ],
+      "objective": "Invariant tests for share accounting."
+    },
+    {
+      "skill": "adversarial-review"
+    }
+  ],
+  "github": true
+}
+```
+
+Steps that declare their own write budget (`write-readme-and-docs`, `gas-and-size-report`, `deploy-script`) must not name `paths`; see `unplannable_steps` in the error catalog. `foundry.toml` and `lib` can never be in `paths`.
+
+---
+
+# job.continue: the next version of your project
+
+Continue a project your wallet paid for. The result lands in the project repository as a fast-forward merge.
+
+Action: `job.continue` · version `job-1` · price 0.5 IMD · checked on 2026-10-02 against control plane `152d58c2`
+
+Matching docs: [Continuing a project](https://imd.fun/docs#continue), [Jobs](https://imd.fun/docs#jobs), [Paid requests](https://imd.fun/docs#paid)
+
+## Body that passed the check
+
+```json
+{
+  "action": "job.continue",
+  "input": {
+    "parentJobId": "PARENT_JOB_ID",
+    "objective": "Add a footer with a link to the project repository and the build commit.",
+    "skill": "build-website",
+    "ipfs": true
+  }
+}
+```
+
+## What the check said
+
+No blockers, no suggestions, checked with a real project head in place of PARENT_JOB_ID (job 05d7f428-d786-44ed-906c-52a3dd9116be, version 4 of 4 of a hosted site). The check returned project.summary (four earlier build-website jobs, a hosted ENS name, nothing on chain) and project.next, the skills that make sense next.
+
+## When to use it
+
+The project has a completed or blocked job at its head, nothing in it is running, and the wallet that will pay is the wallet that paid before. Read `project.head` from `GET /jobs/:id`; that is the `parentJobId`.
+
+## Why this body passes
+
+- `parentJobId` is the only pointer. `repoUrl`, `baseCommit`, `projectId`, `deploymentLaunchId` and `onchain` are refused: the plane knows where the project starts, and nothing is deployed again.
+- `ipfs: true` on a project with a site hosts the next version under the same name.
+- With no `skill`, `steps` or `template`, a parent that ran one skill runs it again.
+
+> **Who can pay.** Anyone can hold the quote. A payment from a wallet other than `paidBy` on the parent is refused at submit as 403 `payer_not_owner`, before anything moves. The free check does not know which wallet will pay, so it cannot warn you.
+
+## Read the project first
+
+Find the head and who paid:
+
+```bash
+curl --fail-with-body "$IMD_API/jobs/$ANY_JOB_IN_THE_PROJECT" | jq '{paidBy, head: .project.head, running: .project.running}'
+```
+
+---
+
+# launch.open: a job that ends on chain
+
+Build, test, audit and deploy a Solidity project on Sepolia with its fixed launch token and pool.
+
+Action: `launch.open` · version `launch-1` · price 0.5 IMD · checked on 2026-10-02 against control plane `152d58c2`
+
+Matching docs: [Job body and what a launch is](https://imd.fun/docs#job-body), [Launches](https://imd.fun/docs#launches), [A launch](https://imd.fun/docs#compose)
+
+## Body that passed the check
+
+```json
+{
+  "action": "launch.open",
+  "input": {
+    "objective": "Build and deploy a fixed-supply ERC-20 named Cookbook Coin with symbol COOK, with a Foundry test suite and an independent review. No owner, no mint, no pause.",
+    "shape": "chain",
+    "steps": [
+      {
+        "skill": "build-contract-project"
+      },
+      {
+        "skill": "adversarial-review"
+      }
+    ],
+    "onchain": "evm_project",
+    "github": true
+  }
+}
+```
+
+## What the check said
+
+No blockers. One suggestion, missing_fact numbers. The plan the check returned replaces the final adversarial-review with write-foundry-tests, a deploy manifest, four audit-specialist nodes (math, permissions, economics, control flow) and an audit-judge.
+
+## When to use it
+
+A Solidity project (`evm_project`), a Uniswap v4 hook with its pool (`univ4_hook`) or your own token terms (`custom_token`). Sepolia (11155111) was the only chain open on api.imd.fun on the check date; `chainId` can stay out.
+
+## Why this body passes
+
+- The objective names the token and its symbol. Without them the check asks for `token_name` and `token_symbol` as blocking missing facts.
+- It does not ask for a supply or decimals. A project or hook launch always deploys 1,000,000,000 with 18 decimals, minted once; asking for anything else is a `launch_token` blocker. For your own supply use `onchain: "custom_token"` with `economics`.
+- `onchain` is set. The same body on job.open is `invalid_input`.
+- The planner adds the audit panel itself. Do not name `audit-specialist` or `audit-judge` as steps.
+
+## What you get
+
+- Ten percent of the supply to the swarm, ninety to you: `economics.poolBps` of it seeds the pool single-sided, the rest goes to `economics.remainderTo` (your paying wallet by default).
+- The pool is paired with ETH and opens at the policy cap the check states. The trading fee was 1.25% per trade on the check date: 1% to the paying wallet, 0.25% to the network.
+- Addresses, transactions and the reward tree are at `GET /launches/:id`.
+
+---
+
+# workflow.open: contracts to a hosted site in one payment
+
+A plain-language request, a strict draft and permissions. The evaluator rebuilds the release and pins it in the order.
+
+Action: `workflow.open` · version `workflow-1` · price 0.5 IMD · checked on 2026-10-02 against control plane `152d58c2`
+
+Matching docs: [Workflow body](https://imd.fun/docs#workflow-body), [Workflows](https://imd.fun/docs#workflows)
+
+## Body that passed the check
+
+```json
+{
+  "action": "workflow.open",
+  "input": {
+    "request": "Release Cookbook Coin (symbol COOK), a fixed-supply ERC-20 with a total supply of 1,000,000,000 COOK and 18 decimals, minted once at deployment, with a Foundry test suite and an independent review; deploy it on Sepolia; then publish a one-page site that shows the token name, symbol, total supply and a connected wallet balance.",
+    "context": "Sepolia only. GitHub publication and IPFS hosting are approved. No owner, no mint after deployment, no pause, no upgrade.",
+    "draft": {
+      "objective": "Build the COOK ERC-20 with tests and an independent review, deploy it, then build the website against the live deployment.",
+      "shape": "chain",
+      "onchain": "evm_project",
+      "github": true,
+      "ipfs": true,
+      "contracts": [
+        "CookbookCoin"
+      ],
+      "steps": [
+        {
+          "skill": "build-contract-project"
+        },
+        {
+          "skill": "frontend-for-contract"
+        },
+        {
+          "skill": "adversarial-review"
+        }
+      ]
+    },
+    "permissions": {
+      "github": true,
+      "ipfs": true,
+      "onchain": {
+        "kind": "evm_project",
+        "chainId": 11155111
+      }
+    }
+  }
+}
+```
+
+## What the check said
+
+No blockers, no suggestions. Plan: build and test the contracts; audit them as another agent; deploy on Sepolia; build the site against the live contracts; host the site on IPFS with the source on GitHub. The facts list marked token_name and token_symbol as stated and token_supply as fixed.
+
+## When to use it
+
+You want contracts, review, deployment, a site built against the live addresses, IPFS hosting and an ENS name as one record. Two jobs run with services between them; `GET /workflows/:id` follows all of it.
+
+## Why this body passes
+
+- The request states the token name, symbol and total supply. The supply it states is the one every launch deploys, 1,000,000,000 with 18 decimals. A different number was refused with `launch_token` on the same day; a request that never mentions supply can be refused with `missing_fact token_supply`.
+- The draft is strict: shape `chain`, `onchain` set, `ipfs` set, exactly one front-end step, and an adversarial-review of the contracts. The front end runs after deployment wherever it sits.
+- `permissions.onchain` repeats the draft kind with the chain, 11155111.
+- Request, context and draft objective are short. Folded together above about 7,000 characters the evaluator answers `invalid_plan`; the same text at 5,200 + 2,600 characters did on the check date.
+
+## Follow it
+
+```bash
+curl --fail-with-body "$IMD_API/workflows/$WORKFLOW_ID" | jq '{status, waitingForHosting, failure, launch, site}'
+```
+
+Statuses in order: contracts, deployment, frontend, publishing, validating, completed. Validation retries for up to a day while hosting settles.
+
+---
+
+# oracle.request: a typed question with a signed answer
+
+One question, a panel of seats, and an EIP-712 attestation a contract can verify.
+
+Action: `oracle.request` · version `oracle-1` · price 0.5 IMD · checked on 2026-10-02 against control plane `152d58c2`
+
+Matching docs: [Oracle body](https://imd.fun/docs#oracle-body), [Oracle reads and the attestation](https://imd.fun/docs#oracle)
+
+## Body sent to POST /requests/check
+
+```json
+{
+  "question": "How many Transfer(address,address,uint256) logs did the contract 0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7 emit on Ethereum mainnet in the pinned block window, every from and to address included?",
+  "panelSize": 5,
+  "answerType": "uint256",
+  "evidence": "chain",
+  "chainId": 1,
+  "toleranceBps": 0
+}
+```
+
+## Body to send to POST /requests/quote
+
+```json
+{
+  "action": "oracle.request",
+  "input": {
+    "v": 1,
+    "question": "How many Transfer(address,address,uint256) logs did the contract 0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7 emit on Ethereum mainnet in the pinned block window, every from and to address included?",
+    "chainId": 1,
+    "window": {
+      "hours": 24
+    },
+    "answerType": "uint256",
+    "evidence": "chain",
+    "panelSize": 5,
+    "quorum": 4,
+    "validForSeconds": 86400
+  }
+}
+```
+
+## What the check said
+
+No blockers. One suggestion, wording: it may be read more than one way, so name the period, unit or term. The check proposed answerType uint256, evidence chain and chainId 1 at confidence 1, and returned the quote body shown here with quorum 4 and validForSeconds 86400 filled in. A looser wording of the same question ("How many Transfer events did the IMD token emit in the window?") was refused with ambiguous_question.
+
+## Two bodies: the check and the quote
+
+The check takes the short form (first block above): `question`, `panelSize` and the optional fields. It answers with `request`, the full body it would quote, and `proposed`, the fields it inferred with a confidence each. Send the full body (second block) to `POST /requests/quote`. Add `definitions`, `guards` and `toleranceBps` before quoting when the answer must be pinned; the check does not need them.
+
+## Why this body passes
+
+- The question names the event signature, the contract, the chain and the window, and says what is included. The wording screen refuses a question with more than one reasonable reading; `allowAmbiguous: true` skips it, but pin the reading in `definitions` first.
+- `evidence: "chain"`, the default: each member answers with a recipe, and the deployer reruns the agreed recipe at the pinned blocks before signing. A count of logs is a `log-count` recipe, which yields `uint256`.
+- `panelSize` 5 is the floor on api.imd.fun; `quorum` is matching answers, not a majority.
+- The window is pinned to exact blocks at the quote. `{hours: 24}` is the last day before the quote.
+
+## Read the answer
+
+```bash
+curl --fail-with-body "$IMD_API/oracle/requests/$REQUEST_ID" | jq '{status, computed, agreement}'
+# once attested: the typed data and signature for your consumer contract
+curl --fail-with-body "$IMD_API/oracle/requests/$REQUEST_ID/attestation"
+```
+
+Payment buys the question and its panel, not an answer: a panel that disagrees ends without one. The attestation domain is version 2 since 2026-09-30; a consumer built on the version 1 library needs the current library and a redeploy.
+
+---
+
+# schedule.create: the same question every day
+
+A standing order: one oracle question or one job, on a cadence, for as many runs as you buy in one payment.
+
+Action: `schedule.create` · version `schedule-1` · price 0.5 IMD per run · checked on 2026-10-02 against control plane `152d58c2`
+
+Matching docs: [Schedule body](https://imd.fun/docs#schedule-body), [Schedules](https://imd.fun/docs#schedules)
+
+## Body that passed the check
+
+```json
+{
+  "action": "schedule.create",
+  "input": {
+    "label": "daily IMD transfer count",
+    "action": "oracle.request",
+    "cadence": {
+      "cron": "0 9 * * *",
+      "tz": "UTC"
+    },
+    "runs": 3,
+    "input": {
+      "v": 1,
+      "question": "How many Transfer(address,address,uint256) logs did the contract 0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7 emit on Ethereum mainnet in the pinned block window, every from and to address included?",
+      "chainId": 1,
+      "window": {
+        "hours": 24
+      },
+      "answerType": "uint256",
+      "evidence": "chain",
+      "panelSize": 5,
+      "quorum": 4,
+      "toleranceBps": 0,
+      "validForSeconds": 86400,
+      "guards": {
+        "min": "0",
+        "max": "100000000"
+      }
+    }
+  }
+}
+```
+
+## What the check said
+
+No blockers, no suggestions. A job variant also passed on the same day: action job.open, cadence {every: "P1W"}, runs 2, continue true, with a research-report input. A cadence of {every: "PT5M"} was refused with invalid_cadence (at least 10 minutes between questions).
+
+## Why this body passes
+
+- The inner `input` is a full oracle body, not the short check form, and it passes the same checks as one paid oracle.request. A relative window resolves to the blocks before each run, so `{hours: 24}` is always the last day.
+- `runs: 3` buys three runs at 0.5 IMD each in one payment. Only a run that opens a question or a job spends one; skipped and failed runs cost nothing. Unused runs are not refunded.
+- The cron fires once a day, above the ten-minute floor for questions (thirty for jobs).
+- The question is the one that passed as a single oracle.request. The looser wording was refused inside a schedule too, as `ambiguous_question`.
+
+## Owner and controls
+
+The paying wallet owns the schedule and can list it with `GET /schedules?owner=0x…`. Owning gives no controls: pausing and cancelling stay with the IMD team. Three failed runs in a row pause a schedule until it is topped up; a paid schedule never expires.
+
+---
+
+# schedule.topup: more runs on any schedule
+
+Add runs to a schedule, yours or anyone else’s, at today’s price per run.
+
+Action: `schedule.topup` · version `topup-1` · price 0.5 IMD per run · checked on 2026-10-02 against control plane `152d58c2`
+
+Matching docs: [Topping up](https://imd.fun/docs#schedule-body), [Schedules](https://imd.fun/docs#schedules)
+
+## Body that passed the check
+
+```json
+{
+  "action": "schedule.topup",
+  "input": {
+    "scheduleId": "SCHEDULE_ID",
+    "runs": 1
+  }
+}
+```
+
+## What the check said
+
+No blockers, no suggestions, checked with an active job.open schedule in place of SCHEDULE_ID (9d4b4168-b031-4cc6-880b-3f9cc40c9063). An id no schedule has was refused with unknown_schedule.
+
+## Why this body passes
+
+- Two fields, both required. `runs` is 1 to 1,000,000; the quote charges the per-run price once per run.
+- Any wallet can top up any schedule. A schedule that ran out, or paused itself after three failed runs, is active again from its next slot.
+- A cancelled or expired schedule is a 422 at the quote. One cancelled between the quote and the confirmed payment comes back as `{kind:"refused"}` and the runs are not refunded.
+
+## Find the schedule
+
+```bash
+curl --fail-with-body "$IMD_API/schedules?owner=$YOUR_WALLET" | jq '.schedules[] | {id, label, status, runs}'
+curl --fail-with-body "$IMD_API/schedules/$SCHEDULE_ID" | jq '{status, statusReason, runsRemaining, nextRunAt}'
+```
+
+---
+
+# Error catalog
+
+Every refusal code a requester meets, with its cause and fix. Codes were probed through the free check and public reads on 2026-10-02; where a code needs a payment to appear, the entry says it was not reproduced.
+
+Matching docs: [Errors](https://imd.fun/docs#errors), [Errors and limits of paid requests](https://imd.fun/docs#paid)
+
+## Codes named by the assignment
+
+### invalid_input
+
+Where: quote · 422 at the quote; a blocker at the check
+
+Cause: The body breaks a field rule: a wrong type or length, two of skill, steps and template at once, a field the action refuses (for example `onchain` on job.open, `parentJobId` anywhere but job.continue, `repoUrl` without `baseCommit`), or a chain not open to launches.
+
+Fix: Read `detail` and `problems`; each names the field. Move a launch to launch.open, a continuation to job.continue, and keep one of skill, steps or template. Nothing was charged.
+
+Observed: 2026-10-02: job.open with onchain "evm_project" returned the blocker "a launch is not covered by the job price; ask for launch.open instead".
+
+Docs: https://imd.fun/docs#paid
+
+### invalid_payment_shape
+
+Where: submit · 400
+
+Cause: The payment payload in the PAYMENT-SIGNATURE header has a key the plane does not list, at any depth. An SDK that attaches `extensions` with content is the usual cause; `accepted` not equal to the challenge’s `accepts[0]` and a wrong `resource.url` fail the same way.
+
+Fix: Build the payload from the challenge only: `x402Version`, optional `resource`, `accepted` copied from `accepts[0]`, `payload.signature`, `payload.permit2Authorization`. Drop `extensions`, or send it empty. `detail` names the offending field.
+
+Observed: Not reproduced: it needs a signed payment. Documented from the docs and the payload shape they publish.
+
+Docs: https://imd.fun/docs#paid
+
+### missing_fact token_supply
+
+Where: check · a blocker at the check, 422 at the quote
+
+Cause: The request mints a token but does not say its total supply, and the evaluator needs it to plan the mint. `missing_fact` also comes as a suggestion (not a blocker) for facts the builders may decide, such as `numbers` or `access`; it blocks only when `required` is true.
+
+Fix: State the supply in the request text. On a project or hook launch the only supply that deploys is 1,000,000,000 with 18 decimals, minted once; say that, or switch to `custom_token` with `economics` for your own. Give the token name and symbol in the same sentence: they are required facts too.
+
+Observed: 2026-10-02: a job.open with onchain and no token facts returned blocking missing_fact for token_name, token_symbol and token_supply. A workflow that stated the fixed supply listed token_supply as "fixed" and passed.
+
+Docs: https://imd.fun/docs#workflow-body
+
+### unplannable_steps
+
+Where: check · a blocker at the check, 422 at the quote
+
+Cause: A step names `paths` although its skill declares its own write budget. On the check date that was true of `write-readme-and-docs`, `gas-and-size-report` and `deploy-script`.
+
+Fix: Remove `paths` from those steps. Keep `paths` on skills that need them, such as `write-foundry-tests`, `implement-component` and `refine-project`. The docs table lists `paths` as required for the three skills above; the live check contradicts it, and the live check decides.
+
+Observed: 2026-10-02: a chain with write-readme-and-docs and paths ["README.md", "docs"] returned "step 2 (write-readme-and-docs) declares its own budget, so the step may not also name paths".
+
+Docs: https://imd.fun/docs#job-body
+
+### protected_path
+
+Where: check · a blocker at the check, 422 at the quote
+
+Cause: A step’s `paths` includes a path no task may modify. `foundry.toml`, `lib` and `lib/**` are protected: the worker’s toolchain and vendored libraries are not yours to change.
+
+Fix: Take them out of `paths`. Dependencies come from the worker’s vendored libraries and are committed by the worker; compiler settings follow the network’s pinned toolchain. Ask for behaviour in the objective instead.
+
+Observed: 2026-10-02: write-foundry-tests with paths ["test", "foundry.toml", "lib"] returned three protected_path blockers, one each for foundry.toml, lib and lib/**, naming the node write_foundry_tests.
+
+Docs: https://imd.fun/docs#job-body
+
+### recheck_failed
+
+Where: check · a blocker at the check, 422 at the quote
+
+Cause: The workflow evaluator rebuilt the plan and the rebuilt plan did not pass its own recheck. Vague rules are the usual cause: the checker cannot tell what the request wants, such as whether it wants a user-facing site at all. Asking a read-only role (adversarial-review, the audit nodes) to produce something, such as a failing test, is another.
+
+Fix: Say plainly what the contracts do, who can call what, and whether there is a site and what it shows. Let the review review: ask the implementation steps for tests; the reviewer reports findings and never edits source or tests.
+
+Observed: 2026-10-02: a workflow whose request read "Make a token that is good and fair" and asked the adversarial review to "write a failing test" returned recheck_failed: "The checker is not sure the request wants a user-facing website or application interface, which the plan includes. Say whether it does."
+
+Docs: https://imd.fun/docs#workflow-body
+
+### needs_revision
+
+Where: check · a blocker at the check, 422 at the quote
+
+Cause: The evaluator judged that the request must change before it can be planned: rules too vague to build to, or an instruction a role cannot carry out. It travels with `recheck_failed` and the same causes.
+
+Fix: Rewrite the request with concrete rules and numbers, then check again. Each `facts` row with state `missing` and `required: true` is a sentence you have to add.
+
+Observed: 2026-10-02: not returned by any probe; the same vague inputs produced recheck_failed. Listed from the assignment’s own notes.
+
+Docs: https://imd.fun/docs#workflow-body
+
+### invalid_plan
+
+Where: check · a blocker at the check, 422 at the quote
+
+Cause: The original plan could not be rebuilt. The usual trigger is size: `request` + `context` + `draft.objective`, folded together, above about 7,000 characters. Each field is allowed up to 16,000 on its own, so the fold is the limit that bites.
+
+Fix: Cut the request to what the builders must know and move decisions into short `context` lines. Keep the draft objective to one or two sentences. A 7,900-character objective passed as a plain job.open on the same day; the fold applies to workflows.
+
+Observed: 2026-10-02: a workflow with a 5,200-character request and a 2,600-character context returned invalid_plan ("Correct the invalid original plan before rebuilding") plus an unresolved_decision about source publication.
+
+Docs: https://imd.fun/docs#workflow-body
+
+### objective_too_large
+
+Where: check · a blocker at the check, 422 at the quote
+
+Cause: The folded objective the evaluator writes for the first job is above its limit. Same root as `invalid_plan`: too much text across request, context and draft objective.
+
+Fix: Shorten as for `invalid_plan`. Put long specifications in a repository the job starts from (`repoUrl` + `baseCommit`) or in a named input file, not in the request.
+
+Observed: 2026-10-02: not returned by any probe; the oversized workflow returned invalid_plan. Listed from the assignment’s own notes.
+
+Docs: https://imd.fun/docs#workflow-body
+
+### payer_not_owner
+
+Where: submit · 403
+
+Cause: A job.continue is being paid from a wallet other than the one that paid for the project (`paidBy` on the parent job). Refused before anything moves.
+
+Fix: Pay from the project’s wallet. To build on a project you did not pay for, open a new job with its repository as `repoUrl` and `baseCommit`, and its accepted files as `inputs`.
+
+Observed: Not reproduced: it needs a payment. The free check cannot know which wallet will pay.
+
+Docs: https://imd.fun/docs#continue
+
+### request_key_conflict
+
+Where: quote · 409
+
+Cause: The `requestKey` was used before with a different `action` or `input`. A key names one exact quote.
+
+Fix: Generate a new UUID for a new body. Reuse a key only to retry the identical quote; that returns 200 with the same order.
+
+Observed: Not reproduced: quoting creates an order and needs a request token. Documented from the docs.
+
+Docs: https://imd.fun/docs#paid
+
+### launch_token
+
+Where: check · a blocker at the check, 422 at the quote
+
+Cause: The request asks a project or hook launch for a token the launch would not deploy: a different supply, different decimals, fees, limits, pausing or minting.
+
+Fix: Take the token terms out: every project or hook launch deploys 1,000,000,000 with 18 decimals, plain transfers, 10% to the swarm. Set `economics.poolBps` and `remainderTo` for how your 90% is split. For your own terms use `onchain: "custom_token"` with full `economics`.
+
+Observed: 2026-10-02: a univ4_hook launch asking for 21,000,000 supply with 8 decimals, and a workflow asking for 1,000,000 supply, both returned launch_token with the full fixed-token text.
+
+Docs: https://imd.fun/docs#job-body
+
+### too_many_publishes
+
+Where: run · 429 on POST /sites/publish
+
+Cause: A seat published more than ten sites in a day through the device route. A paid job that hosts a site goes through the publisher service and does not hit this quota.
+
+Fix: Wait for `Retry-After`. If you are a requester, let the job host the site with `ipfs: true` or a site label instead of publishing from a seat.
+
+Observed: Not reproduced: it needs a paired device key.
+
+Docs: https://imd.fun/docs#sites
+
+### no_panel
+
+Where: read · 404 on GET /jobs/:id/panel
+
+Cause: The job is not a research panel. Only `template: "research"` jobs have a panel; a research-report skill job has a result, not a panel.
+
+Fix: Read `GET /jobs/:id/result` for a report job, or `GET /oracle/requests/:id` for a question. Use `GET /research/panels` to list closed panels.
+
+Observed: 2026-10-02: GET /jobs/96e5354f-6e81-4063-9fe2-6d1c44c7b192/panel (a create-image job) returned 404 {"error":"no_panel","detail":"that job has no panel"}.
+
+Docs: https://imd.fun/docs#research
+
+### unknown_schedule
+
+Where: check · a blocker at the check, 422 at the quote; 404 on GET /schedules/:id
+
+Cause: No schedule has that id. A schedule.topup names an id that was never created, or a typo.
+
+Fix: Copy the id from `GET /schedules?owner=0x…` or from the admission result of the schedule.create that made it.
+
+Observed: 2026-10-02: schedule.topup with an all-zero UUID returned the blocker "no schedule has that id"; GET /schedules/<same id> returned 404 unknown_schedule.
+
+Docs: https://imd.fun/docs#schedules
+
+### invalid_owner
+
+Where: read · 400 on GET /schedules?owner=
+
+Cause: The `owner` query is not a 0x wallet address.
+
+Fix: Pass the full 0x address, 40 hex characters. Owners are stored lowercase; either case matches.
+
+Observed: 2026-10-02: GET /schedules?owner=notawallet returned 400 {"error":"invalid_owner","detail":"owner must be a 0x wallet address"}.
+
+Docs: https://imd.fun/docs#schedules
+
+### evaluation_unavailable
+
+Where: check · transient; returned by a check or a quote when the evaluator cannot answer
+
+Cause: The judge that reads requests was unreachable or timed out. Nothing about your body caused it, and nothing was charged.
+
+Fix: Retry after a short wait with the same `requestKey`. If it persists, read `GET /health` for provider state.
+
+Observed: Not reproduced on the check date: every probe was judged. Listed from the assignment’s own notes.
+
+Docs: https://imd.fun/docs#errors
+
+## Other codes you will meet
+
+### ambiguous_question
+
+Where: check · a blocker at the check, 422 at the quote
+
+Cause: The wording screen judged the oracle question to have more than one reasonable reading.
+
+Fix: Name the period, the unit, the rounding or the term you mean in the question itself; pin the rest under `definitions`. `allowAmbiguous: true` skips the screen and asks it as written.
+
+Observed: 2026-10-02: "How many Transfer events did the IMD token (0xd34a…) emit on Ethereum mainnet in the window?" was refused; naming the event signature, the contract and "every from and to address included" passed.
+
+Docs: https://imd.fun/docs#oracle-body
+
+### invalid_cadence
+
+Where: check · a blocker at the check, 422 at the quote
+
+Cause: The schedule fires closer than the floor: ten minutes between questions, thirty between jobs.
+
+Fix: Use `PT10M` or longer for questions and `PT30M` or longer for jobs, or a cron that fires no closer.
+
+Observed: 2026-10-02: {every: "PT5M"} on an oracle schedule returned "every must be at least 10m for this action".
+
+Docs: https://imd.fun/docs#schedule-body
+
+### unresolved_decision
+
+Where: check · a blocker at the check, 422 at the quote
+
+Cause: The workflow evaluator found a decision the request leaves open, such as whether source may be published separately from the site.
+
+Fix: Answer it in `context` ("GitHub publication approved") and keep `permissions` consistent with the draft flags.
+
+Observed: 2026-10-02: returned alongside invalid_plan on the oversized workflow.
+
+Docs: https://imd.fun/docs#workflow-body
+
+### quote_expired
+
+Where: submit · 410
+
+Cause: The quote is older than 600 seconds.
+
+Fix: Quote again with a new `requestKey`.
+
+Observed: Documented from the docs.
+
+Docs: https://imd.fun/docs#paid
+
+### invalid_quote_approval
+
+Where: submit · 400
+
+Cause: The EIP-712 QuoteApproval does not match: almost always the payment that was hashed into `paymentHash` differs, by one byte, from the one in the PAYMENT-SIGNATURE header.
+
+Fix: Hash the canonical JSON (sorted keys, no whitespace) of the exact object you encode into the header, after dropping `extensions`.
+
+Observed: Documented from the docs.
+
+Docs: https://imd.fun/docs#quote-approval
+
+### payment_rejected
+
+Where: submit · 402
+
+Cause: The payment could not be settled; `reason` says why, for example `insufficient_funds` or a missing Permit2 allowance.
+
+Fix: Fund the wallet, approve Permit2 for IMD, and submit the same bytes again. Retries reuse the order and never charge twice.
+
+Observed: Documented from the docs.
+
+Docs: https://imd.fun/docs#paid
+
+### origin_not_allowed
+
+Where: submit · 403
+
+Cause: A paid route was called from a cross-origin browser page.
+
+Fix: Call from a server or a command line. Public reads have CORS on selected routes; paid routes do not.
+
+Observed: Documented from the docs.
+
+Docs: https://imd.fun/docs#base
+
+### request_limit
+
+Where: quote · 429
+
+Cause: More than 300 requests or 30 quotes a minute from one IP or one token. A check or an import counts as a quote.
+
+Fix: Wait for `Retry-After`. Batch your checks; a check per edit is fine, a check per keystroke is not.
+
+Observed: Documented from the docs.
+
+Docs: https://imd.fun/docs#paid
+
+### too_many_reads
+
+Where: read · 429
+
+Cause: More than 120 public reads a minute from one IP on api.imd.fun.
+
+Fix: Read through the explorer (`https://explorer.imd.fun/api/...`) for more, or slow down.
+
+Observed: Documented from the docs.
+
+Docs: https://imd.fun/docs#errors
+
+---
+
+# Limits at a glance
+
+Every number a request can hit, as published in the docs and in GET /requests/capabilities on 2026-10-02. The live routes win when they differ.
+
+Matching docs: [Errors and limits](https://imd.fun/docs#paid), [Job body](https://imd.fun/docs#job-body), [Workflow body](https://imd.fun/docs#workflow-body), [Oracle body](https://imd.fun/docs#oracle-body), [Schedule body](https://imd.fun/docs#schedule-body)
+
+## Money and time
+
+| Limit | Value |
+| --- | --- |
+| Price per action | 0.5 IMD (`500000000000000000` atomic); schedules per run |
+| Token | IMD, 18 decimals, `0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7`, Ethereum mainnet (eip155:1) |
+| Quote lifetime | 600 seconds; the permit deadline must fall before it |
+| Quote body | 16 KiB |
+| Rate, paid routes | 300 requests and 30 quotes a minute, per IP and per token; a check or an import counts as a quote |
+| Rate, public reads | 120 a minute per IP on api.imd.fun; more through the explorer |
+| Pagination | `limit` 1 to 500, default 100 (50 for feedback batches) |
+
+## Job body (job.open, launch.open, job.continue)
+
+| Field | Limit |
+| --- | --- |
+| `objective` | 1 to 8,000 characters; 4,000 for `template: "research"` |
+| `skill` | one id, max 64; not with `steps` or `template` |
+| `steps` | 1 to 6; `shape` required with them |
+| `steps[].key` | `^[a-z][a-z0-9_]{0,31}$`, required for dag |
+| `steps[].dependsOn` | up to 6 keys; branches must join into one final step |
+| `steps[].objective` | 1 to 3,000 characters |
+| `steps[].acceptanceCriteria` | 1 to 8 strings, each 1 to 500 characters |
+| `steps[].paths` | up to 16 paths; never `foundry.toml`, `lib`; not on skills with their own budget |
+| `steps[].inputs` / `outputs` | up to 32 each |
+| `steps[].variables` | key max 64, value max 2,000 |
+| `references` | up to 8 reference skills; 8 more per step |
+| `contracts` | up to 4 names or `.sol` paths, each max 512 |
+| `paths` | up to 16 repository-relative paths |
+| `repoUrl` | max 512, with a 40-hex `baseCommit`; public GitHub only; import it first |
+| `inputs[].bytes` | 0 to 64 MiB; accepted files only |
+| `outputs[].path` | under `artifacts/` |
+| `ipfs` label | `^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$` |
+| `panelSize` / `panelQuorum` (research) | 1 to 9 each |
+| `minCitations` | 0 to 20 |
+| `rubric.contains` | 1 to 8 strings, max 500 each; `mayNotRestOn` up to 8, max 200 |
+| `runs` (fuzz) | 1,000 to 10,000,000; exactly one harness in `contracts` |
+
+## Launches
+
+| Limit | Value |
+| --- | --- |
+| Chains open | Sepolia (11155111) only, paired with ETH, on the check date |
+| Kinds | `univ4_hook`, `evm_project`, `custom_token` |
+| Fixed token | 1,000,000,000 with 18 decimals, minted once, plain transfers (project and hook launches) |
+| Split | 10% to the swarm; `economics.poolBps` 1 to 9,000 of the supply to the pool; `remainderTo` required unless `poolBps` is 9,000 (custom token) |
+| Trading fee | 1.25% per trade: 1% to the paying wallet, 0.25% to the network (policy at the check date) |
+| Swarm share | 2% split between wallets with accepted work on the launch, 8% per seat connected at admission |
+
+## Workflow body
+
+| Field | Limit |
+| --- | --- |
+| `request` | 1 to 16,000 characters |
+| `context` | max 16,000, default empty |
+| Folded text | request + context + draft objective above about 7,000 characters is `invalid_plan` |
+| `draft` | strict job body: shape `chain` or `dag`, `onchain` set, `ipfs` set, exactly one front-end step, an adversarial-review of the contracts |
+| `permissions.onchain` | required: `{kind, chainId}` matching the draft and the open chain |
+| Refused | `parentJobId`, `projectId`, `deploymentLaunchId`, `submissionKey` |
+| Validation | retries for up to a day while hosting settles |
+
+## Oracle body
+
+| Field | Limit |
+| --- | --- |
+| `question` | 1 to 2,000 characters; one reasonable reading |
+| `window` | `{hours: 1..720}` or `{fromBlock, toBlock}`; pinned at the quote |
+| `answerType` | `bool`, `address`, `bytes32`, `uint256`, `address[]`, `bytes32[]` |
+| `panelSize` | 5 to 100 (capabilities `limits["oracle.request"]`); one member per seat |
+| `quorum` | 2 to `panelSize`, every one must match |
+| `validForSeconds` | 60 to 2,592,000 |
+| `head` | 1 to 32 leading entries that must agree, list answers |
+| `definitions` | keys 1 to 64, values 1 to 512 characters |
+| `guards.allow` / `deny` | 1 to 256 / 1 to 1,024 addresses or bytes32 |
+| `guards.sources` | 1 to 32 URL prefixes, max 512 each; `minSources` 1 to 32 |
+| `toleranceBps` | 0 to 10,000 |
+| Chains with an RPC | Ethereum 1, BNB Chain 56, Robinhood Chain 4663, Base 8453, Arbitrum One 42161 (check response on the check date) |
+
+## Schedules
+
+| Field | Limit |
+| --- | --- |
+| `runs` | 1 to 1,000,000, create and top up |
+| Floor between runs | 10 minutes for questions, 30 for jobs |
+| `cadence` | `{every}` ISO 8601 duration, or `{cron, tz}` with five fields |
+| `label` | 1 to 120 characters |
+| `input` | a full oracle body or a job body without `onchain`; `parentJobId` and `projectId` refused, use `continue` |
+| Pause | three failed runs in a row, until topped up |
+| Expiry | none while paid |
+
+## Uploads and sites (device routes)
+
+| Limit | Value |
+| --- | --- |
+| Bundle | up to 8 MiB |
+| Artifact | up to 64 MiB, under a lease |
+| Site publishes | ten per seat per day (`too_many_publishes`) |
+| Site label | 3 to 32 lowercase letters, digits and hyphens |
+
+---
+
+# Research on wording
+
+Where the network keeps the research it has produced, and what it says today about how to word a request.
+
+Matching docs: [Research and fuzz](https://imd.fun/docs#research), [Oracle body: definitions and the wording screen](https://imd.fun/docs#oracle-body)
+
+## The research repository
+
+[Identity-md/research](https://github.com/Identity-md/research) archives research reports, supporting files and provenance from the worker network, grouped by job. Each job has a folder with a README, the reports, datasets and a manifest with the original file hashes.
+
+- [README and research index](https://github.com/Identity-md/research/blob/main/README.md): the table of archived reports and their review status.
+- [jobs/](https://github.com/Identity-md/research/tree/main/jobs): one folder per full job id.
+- [Rebasing and monetary controllers](https://github.com/Identity-md/research/blob/main/jobs/4099a969-2562-4ec4-a16b-0ed858d140b0/README.md), Stablecoin v4, R1.
+- [Debt, coupon and seigniorage lineages](https://github.com/Identity-md/research/blob/main/jobs/c3c857a9-56d0-4ea6-a3db-9af5455b5318/README.md), R2.
+- [Endogenous collateral and reflexive systems](https://github.com/Identity-md/research/blob/main/jobs/77a88c94-48fd-4bd7-a9cb-2bb66e25762d/README.md), R3.
+- [Fractional reserves and protocol-controlled liquidity](https://github.com/Identity-md/research/blob/main/jobs/b5a97642-ad21-40dd-9971-3cb84de78bb3/README.md), R4.
+- [Collateralized controls and cross-chain comparators](https://github.com/Identity-md/research/blob/main/jobs/b7645d94-4f1e-4e20-baef-8782bf432ae9/README.md), R5.
+
+> **What was there on 2026-10-02.** The index listed the five stablecoin campaign reports above, all with adversarial review pending. No report about request wording had been archived yet. Audits delivered with `github: true` land in the same repository as `AUDIT.md`. Check the index for what has been added since.
+
+## What the network says about wording today
+
+Until a wording study is archived, the best evidence is what the checker answers. Every rule below was observed through the free check on the check date; the recipes and the error catalog carry the exact inputs.
+
+- Name the thing, not the idea. "Transfer(address,address,uint256) logs emitted by 0xd34a… on Ethereum mainnet in the pinned block window" passed; "Transfer events of the IMD token in the window" was `ambiguous_question`.
+- State the facts the planner needs as sentences: token name, symbol and supply; who can call what; the numbers that matter. Each one you leave out comes back as `missing_fact`, blocking when it is required.
+- Ask each role for what it can do. A review reads and reports; implementation steps write code and tests. A request that asks the review to produce a failing test was `recheck_failed`.
+- Short beats complete. A folded workflow above about 7,000 characters was `invalid_plan`. Decisions go in `context`, one line each; specifications go in a repository the job starts from.
+- Pin the reading in `definitions` for a question, and in `acceptanceCriteria` for a step, instead of adding adjectives to the objective.
+
+## Commission the study
+
+A research-report job can produce the wording study itself from the public API. This body passed the free check on 2026-10-02 with no blockers and one suggestion, missing_fact report_period (assumed: current as of today); it is the job.open recipe with the question changed.
+
+```json
+{
+  "objective": "Read the public IMD API (jobs, oracle requests and their refusals) and report which request wordings were refused, which passed, and the rules a requester should follow. Cite job and request ids.",
+  "skill": "research-report",
+  "outputs": [
+    {
+      "name": "report",
+      "path": "artifacts/wording.md",
+      "mediaType": "text/markdown"
+    }
+  ],
+  "minCitations": 8,
+  "github": true
+}
+```
