@@ -16,16 +16,21 @@ ${BANNER}
 Usage:
   node cli/imd-check.mjs <action> <body.json>
   node cli/imd-check.mjs <action> - < body.json
+  node cli/imd-check.mjs --dry-run <action> <body.json>   # print the request, send nothing
 
 Actions: ${ACTIONS.join(', ')}
 
-The file holds the action's input (the "input" of a quote), as on the recipe pages.
+The file holds either the full request block shown on the recipe pages,
+{"action": ..., "input": {...}}, or just the action's input (the "input" of a quote).
+A full block whose "action" differs from <action> is refused with exit 1.
 Prints the check's blockers and suggestions; exits 0 when there are no blockers,
 2 when there are, 1 on a transport or usage error. Reads IMD_API to target another plane.
 `);
 }
 
-const [action, file] = process.argv.slice(2);
+const args = process.argv.slice(2);
+const dryRun = args.includes('--dry-run');
+const [action, file] = args.filter((a) => a !== '--dry-run');
 if (!action || action === '--help' || action === '-h' || !file) {
   help();
   process.exit(action && action !== '--help' && action !== '-h' ? 1 : 0);
@@ -41,6 +46,21 @@ try {
 } catch (e) {
   console.error(`cannot read ${file}: ${e.message}`);
   process.exit(1);
+}
+// A full {action, input} block, as the recipe pages show it: send its input, not the block.
+// Exactly those two keys: a schedule.create input also has action and input, plus cadence and runs.
+const keys = input && typeof input === 'object' && !Array.isArray(input) ? Object.keys(input).sort().join() : '';
+if (keys === 'action,input') {
+  if (input.action !== action) {
+    console.error(`${file} is a ${JSON.stringify(input.action)} block, not ${action}`);
+    process.exit(1);
+  }
+  input = input.input;
+}
+
+if (dryRun) {
+  console.log(JSON.stringify({ action, input }));
+  process.exit(0);
 }
 
 let res;

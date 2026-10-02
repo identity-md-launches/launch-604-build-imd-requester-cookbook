@@ -76,7 +76,12 @@ site, the `build-website` skill with `ipfs: true` or a site label pins exactly t
 node cli/imd-check.mjs --help
 node cli/imd-check.mjs schedule.topup body.json     # exit 0 when there are no blockers, 2 when there are
 echo '{"scheduleId":"…","runs":1}' | node cli/imd-check.mjs schedule.topup -
+node cli/imd-check.mjs --dry-run job.open block.json  # print the request it would send, send nothing
 ```
+
+The file may be the full `{"action": …, "input": {…}}` block a recipe page shows, or the bare input. A full block
+whose `action` differs from the command's action exits 1. `node --test cli/test/imd-check.test.mjs` dry-runs every
+recipe example in both shapes and replays the live responses saved in `cli/test/fixtures/live/`.
 
 The check creates no order and charges nothing. It counts as a quote for rate limiting (30 a minute).
 
